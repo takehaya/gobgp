@@ -675,8 +675,12 @@ func (r *MUPType1SessionTransformedRoute) DecodeFromBytes(data []byte, afi uint1
 		return malformedAttrListErr(fmt.Sprintf("Invalid Endpoint Address length: %d", r.EndpointAddressLength))
 	}
 	p += int(r.EndpointAddressLength / 8)
-	if len(data) < p+1 {
-		return malformedAttrListErr("invalid 3GPP 5G specific Type 1 Session Transformed Route length")
+	// The Source Address is optional (see Serialize): draft-mpmz-bess-mup-safi-01
+	// ends the NLRI here, so no bytes remaining means the route has no source.
+	// Only -03 carries the trailing SourceAddressLength octet. The NLRI is bound
+	// to its declared length upstream, so len(data) is the exact route length.
+	if p >= len(data) {
+		return nil
 	}
 	r.SourceAddressLength = data[p]
 	p += 1
@@ -724,11 +728,29 @@ func (r *MUPType1SessionTransformedRoute) Serialize() ([]byte, error) {
 	buf = append(buf, r.QFI)
 	buf = append(buf, r.EndpointAddressLength)
 	buf = append(buf, r.EndpointAddress.AsSlice()...)
-	buf = append(buf, r.SourceAddressLength)
-	if r.SourceAddressLength > 0 {
-		buf = append(buf, r.SourceAddress.AsSlice()...)
+	// The Source Address is optional. draft-mpmz-bess-mup-safi-01 ends the NLRI
+	// at the Endpoint Address (no Source Address field at all), while -03 always
+	// carries at least a SourceAddressLength octet. Emit the field only when a
+	// source address or a TLV is present so a -01 peer (e.g. ArcOS 8.2.3)
+	// accepts the route; Len() and DecodeFromBytes() agree with this framing.
+	if r.hasSourceAddressField() {
+		if r.SourceAddress != nil {
+			buf = append(buf, r.SourceAddressLength)
+			buf = append(buf, r.SourceAddress.AsSlice()...)
+		} else {
+			buf = append(buf, 0)
+		}
 	}
 	return serializeMUPTLVs(buf, r.TLVs)
+}
+
+// hasSourceAddressField reports whether the route is sent with the
+// SourceAddressLength octet. It is left out only when the route has neither a
+// source address nor a TLV: the draft-01 framing has no TLVs, and a decoder
+// could not tell a TLV that directly follows the Endpoint Address from a
+// SourceAddressLength octet.
+func (r *MUPType1SessionTransformedRoute) hasSourceAddressField() bool {
+	return r.SourceAddress != nil || len(r.TLVs) > 0
 }
 
 func (r *MUPType1SessionTransformedRoute) AFI() uint16 {
@@ -740,11 +762,18 @@ func (r *MUPType1SessionTransformedRoute) AFI() uint16 {
 
 func (r *MUPType1SessionTransformedRoute) Len() int {
 	// RD(8) + PrefixLength(1) + Prefix(variable)
-	// + TEID(4) + QFI(1) + EndpointAddressLength(1) + EndpointAddress(4 or 16) + SourceAddressLength(1) + SourceAddress(4 or 16)
+	// + TEID(4) + QFI(1) + EndpointAddressLength(1) + EndpointAddress(4 or 16)
+	// + optional [ SourceAddressLength(1) + SourceAddress(4 or 16) ]
 	// + TLVs(variable)
-	l := 16 + (r.Prefix.Bits()+7)/8 + int(r.EndpointAddressLength/8)
-	if r.SourceAddressLength > 0 {
-		l += int(r.SourceAddressLength / 8)
+	// The Source Address field is omitted when there is neither a source
+	// address nor a TLV, so the wire framing matches draft-mpmz-bess-mup-safi-01
+	// (see Serialize); the base is 15, not 16.
+	l := 15 + (r.Prefix.Bits()+7)/8 + int(r.EndpointAddressLength/8)
+	if r.hasSourceAddressField() {
+		l += 1
+		if r.SourceAddress != nil {
+			l += int(r.SourceAddressLength / 8)
+		}
 	}
 	return l + mupTLVsLen(r.TLVs)
 }
