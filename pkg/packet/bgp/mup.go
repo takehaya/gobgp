@@ -539,8 +539,12 @@ func (r *MUPType1SessionTransformedRoute) DecodeFromBytes(data []byte, afi uint1
 		return malformedAttrListErr(fmt.Sprintf("Invalid Endpoint Address length: %d", r.EndpointAddressLength))
 	}
 	p += int(r.EndpointAddressLength / 8)
-	if len(data) < p+1 {
-		return malformedAttrListErr("invalid 3GPP 5G specific Type 1 Session Transformed Route length")
+	// The Source Address is optional (see Serialize): draft-mpmz-bess-mup-safi-01
+	// ends the NLRI here, so no bytes remaining means the route has no source.
+	// Only -03 carries the trailing SourceAddressLength octet. The NLRI is bound
+	// to its declared length upstream, so len(data) is the exact route length.
+	if p >= len(data) {
+		return nil
 	}
 	r.SourceAddressLength = data[p]
 	p += 1
@@ -575,8 +579,13 @@ func (r *MUPType1SessionTransformedRoute) Serialize() ([]byte, error) {
 	buf = append(buf, r.QFI)
 	buf = append(buf, r.EndpointAddressLength)
 	buf = append(buf, r.EndpointAddress.AsSlice()...)
-	buf = append(buf, r.SourceAddressLength)
-	if r.SourceAddressLength > 0 {
+	// The Source Address is optional. draft-mpmz-bess-mup-safi-01 ends the NLRI
+	// at the Endpoint Address (no Source Address field at all), while -03 always
+	// carries at least a SourceAddressLength octet. Emit the field only when a
+	// source address is present so a -01 peer (e.g. ArcOS 8.2.3) accepts the
+	// route; Len() and DecodeFromBytes() agree with this framing.
+	if r.SourceAddress != nil {
+		buf = append(buf, r.SourceAddressLength)
 		buf = append(buf, r.SourceAddress.AsSlice()...)
 	}
 	return buf, nil
@@ -591,10 +600,13 @@ func (r *MUPType1SessionTransformedRoute) AFI() uint16 {
 
 func (r *MUPType1SessionTransformedRoute) Len() int {
 	// RD(8) + PrefixLength(1) + Prefix(variable)
-	// + TEID(4) + QFI(1) + EndpointAddressLength(1) + EndpointAddress(4 or 16) + SourceAddressLength(1) + SourceAddress(4 or 16)
-	l := 16 + (r.Prefix.Bits()+7)/8 + int(r.EndpointAddressLength/8)
-	if r.SourceAddressLength > 0 {
-		l += int(r.SourceAddressLength / 8)
+	// + TEID(4) + QFI(1) + EndpointAddressLength(1) + EndpointAddress(4 or 16)
+	// + optional [ SourceAddressLength(1) + SourceAddress(4 or 16) ]
+	// The Source Address field is omitted when absent so the wire framing matches
+	// draft-mpmz-bess-mup-safi-01 (see Serialize); the base is 15, not 16.
+	l := 15 + (r.Prefix.Bits()+7)/8 + int(r.EndpointAddressLength/8)
+	if r.SourceAddress != nil {
+		l += 1 + int(r.SourceAddressLength/8)
 	}
 	return l
 }
