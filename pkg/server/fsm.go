@@ -848,24 +848,7 @@ func (fsm *fsm) stateChange(nextState bgp.FSMState, reason *fsmStateReason) {
 		_, peerExt := fsm.capMap[bgp.BGP_CAP_EXTENDED_MESSAGE]
 		fsm.extendedMessage.Store(peerExt)
 
-		// calculate HoldTime
-		// RFC 4271 P.13
-		// a BGP speaker MUST calculate the value of the Hold Timer
-		// by using the smaller of its configured Hold Time and the Hold Time
-		// received in the OPEN message.
-		holdTime := float64(body.HoldTime)
-		myHoldTime := conf.Timers.Config.HoldTime
-		if holdTime > myHoldTime {
-			conf.Timers.State.NegotiatedHoldTime = myHoldTime
-		} else {
-			conf.Timers.State.NegotiatedHoldTime = holdTime
-		}
-
-		keepalive := conf.Timers.Config.KeepaliveInterval
-		if n := conf.Timers.State.NegotiatedHoldTime; n < myHoldTime {
-			keepalive = n / 3
-		}
-		conf.Timers.State.KeepaliveInterval = keepalive
+		conf.Timers.State.NegotiatedHoldTime, conf.Timers.State.KeepaliveInterval = negotiatedTimers(&conf, body)
 
 		// The negotiated graceful restart State below comes from the
 		// OPEN of this session. Clear the values of the previous
@@ -945,6 +928,21 @@ func (fsm *fsm) stateChange(nextState bgp.FSMState, reason *fsmStateReason) {
 			fsm.twoByteAsTrans = true
 		}
 	}
+}
+
+// negotiatedTimers returns the hold time and the keepalive interval, in
+// seconds, of a session whose peer sent open. RFC 4271 Section 4.2 says:
+// "Upon receipt of an OPEN message, a BGP speaker MUST calculate the value of
+// the Hold Timer by using the smaller of its configured Hold Time and the
+// Hold Time received in the OPEN message."
+func negotiatedTimers(conf *oc.Neighbor, open *bgp.BGPOpen) (float64, float64) {
+	myHoldTime := conf.Timers.Config.HoldTime
+	holdTime := min(float64(open.HoldTime), myHoldTime)
+	keepalive := conf.Timers.Config.KeepaliveInterval
+	if holdTime < myHoldTime {
+		keepalive = holdTime / 3
+	}
+	return holdTime, keepalive
 }
 
 // grNegotiated returns what the current session negotiated, for the graceful
@@ -1959,9 +1957,49 @@ func keepaliveTicker(fsm *fsm) *time.Ticker {
 	return time.NewTicker(sec)
 }
 
+// openConfirmTimers are the HoldTimer and the KeepaliveTimer of OpenConfirm.
+// The channels are nil when the hold time is zero.
+type openConfirmTimers struct {
+	holdTimer *time.Timer
+	ticker    *time.Ticker
+	hold      <-chan time.Time
+	keepalive <-chan time.Time
+}
+
+// newOpenConfirmTimers starts the timers with the hold time negotiated with
+// the OPEN that the session received on fsm.conn. RFC 4271 Section 8.2.2
+// says that when a valid OPEN arrives in OpenSent, the local system "sets a
+// KeepaliveTimer (via the text below)" and "sets the HoldTimer according to
+// the negotiated value (see Section 4.2)", and that "If the negotiated hold
+// time value is zero, then the HoldTimer and KeepaliveTimer are not
+// started." Timers.State is filled in only when the session reaches
+// Established, so it has nothing for a session that has never been up, and
+// the values of the previous session otherwise.
+func newOpenConfirmTimers(fsm *fsm) *openConfirmTimers {
+	t := &openConfirmTimers{}
+	holdTime, keepalive := negotiatedTimers(fsm.pConf.ReadOnly(), fsm.recvOpen.Body.(*bgp.BGPOpen))
+	if holdTime == 0 {
+		return t
+	}
+	interval := time.Second * time.Duration(keepalive)
+	if interval == 0 {
+		interval = time.Second
+	}
+	t.holdTimer = time.NewTimer(time.Second * time.Duration(holdTime))
+	t.ticker = time.NewTicker(interval)
+	t.hold, t.keepalive = t.holdTimer.C, t.ticker.C
+	return t
+}
+
+func (t *openConfirmTimers) stop() {
+	if t.holdTimer != nil {
+		t.holdTimer.Stop()
+		t.ticker.Stop()
+	}
+}
+
 func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
-	ticker := keepaliveTicker(fsm)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
@@ -1978,16 +2016,8 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 		fsm.conn.SetReadDeadline(time.Time{})
 	}()
 
-	newHoldTimer := func() *time.Timer {
-		conf := fsm.pConf.ReadOnly()
-		if conf.Timers.State.NegotiatedHoldTime == 0 {
-			return &time.Timer{}
-		}
-		// RFC 4271 P.65
-		// sets the HoldTimer according to the negotiated value
-		return time.NewTimer(time.Second * time.Duration(conf.Timers.State.NegotiatedHoldTime))
-	}
-	holdTimer := newHoldTimer()
+	timers := newOpenConfirmTimers(fsm)
+	defer func() { timers.stop() }()
 
 	for {
 		select {
@@ -2037,10 +2067,10 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 
 			wg.Add(1)
 			go h.recvMessage(ctx, fsm.conn, recvChan, reasonCh, wg)
-			// The old hold timer is not stopped. Its channel is no longer
-			// read, and the timer for hold time zero cannot be stopped.
-			holdTimer = newHoldTimer()
-		case <-ticker.C:
+			// The timers start again with the OPEN on our connection.
+			timers.stop()
+			timers = newOpenConfirmTimers(fsm)
+		case <-timers.keepalive:
 			m := bgp.NewBGPKeepAliveMessage()
 			b, _ := m.Serialize()
 			fsm.conn.SetWriteDeadline(time.Now().Add(time.Second))
@@ -2086,7 +2116,7 @@ func (h *fsmHandler) openconfirm(ctx context.Context) (bgp.FSMState, *fsmStateRe
 		case err := <-reasonCh:
 			fsm.conn.Close()
 			return bgp.BGP_FSM_IDLE, &err
-		case <-holdTimer.C:
+		case <-timers.hold:
 			m := bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_HOLD_TIMER_EXPIRED, 0, nil)
 			_ = fsm.sendNotification(fsm.conn, m)
 			return bgp.BGP_FSM_IDLE, newfsmStateReason(fsmHoldTimerExpired, notificationBody(m), nil)
