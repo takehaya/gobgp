@@ -276,15 +276,15 @@ func TestFSMHandlerOpenconfirm_HoldTimerExpired(t *testing.T) {
 	p, h := makePeerAndHandler(m)
 	t.Cleanup(func() { cleanPeerAndHandler(p, h) })
 
-	// set keepalive ticker
+	// The hold time negotiated with the peer's OPEN is 2 seconds, and
+	// the keepalive interval is longer.
 	p.fsm.lock.Lock()
 	conf := p.fsm.pConf.ReadCopy()
-	conf.Timers.State.KeepaliveInterval = 3
-
-	// set holdtime
-	conf.Timers.State.NegotiatedHoldTime = 2
+	conf.Timers.Config.HoldTime = 2
+	conf.Timers.Config.KeepaliveInterval = 3
 	p.fsm.pConf.Update(&conf)
 	p.fsm.lock.Unlock()
+	p.fsm.recvOpen, _ = bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr("10.0.0.1"), nil)
 
 	state, reason := h.openconfirm(t.Context())
 
@@ -320,10 +320,11 @@ func TestFSMHandlerOpenconfirm_NotificationReceived(t *testing.T) {
 
 			p.fsm.lock.Lock()
 			conf := p.fsm.pConf.ReadCopy()
-			conf.Timers.State.KeepaliveInterval = 30
-			conf.Timers.State.NegotiatedHoldTime = 90
+			conf.Timers.Config.KeepaliveInterval = 30
+			conf.Timers.Config.HoldTime = 90
 			p.fsm.pConf.Update(&conf)
 			p.fsm.lock.Unlock()
+			p.fsm.recvOpen, _ = bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr("10.0.0.1"), nil)
 
 			// net.Pipe writes block until the message is read.
 			go m.PushBgpMessage(bgp.NewBGPNotificationMessage(tt.code, tt.subcode, nil))
@@ -528,12 +529,12 @@ func TestFSMHandlerOpenconfirm_HoldtimeZero(t *testing.T) {
 
 	p.fsm.lock.Lock()
 	conf := p.fsm.pConf.ReadCopy()
-	// set up keepalive ticker
 	conf.Timers.Config.KeepaliveInterval = 1
-	// set holdtime
-	conf.Timers.State.NegotiatedHoldTime = 0
+	conf.Timers.Config.HoldTime = 90
 	p.fsm.pConf.Update(&conf)
 	p.fsm.lock.Unlock()
+	// The peer's OPEN has a hold time of zero.
+	p.fsm.recvOpen, _ = bgp.NewBGPOpenMessage(65002, 0, netip.MustParseAddr("10.0.0.1"), nil)
 
 	go h.openconfirm(t.Context())
 
@@ -2254,6 +2255,10 @@ func TestFSMHandlerOpenconfirm_Collision(t *testing.T) {
 			open, err := bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr(tt.remoteID), nil)
 			require.NoError(t, err)
 			p.fsm.outgoingConnCh <- outgoingConn{conn: outgoing, open: open}
+			// OpenConfirm on the incoming connection, which got the
+			// peer's OPEN.
+			p.fsm.recvOpen, err = bgp.NewBGPOpenMessage(65002, 90, netip.MustParseAddr(tt.remoteID), nil)
+			require.NoError(t, err)
 
 			type result struct {
 				state  bgp.FSMState
@@ -2733,6 +2738,8 @@ func TestFSMHandler_ResetBeforeEstablished(t *testing.T) {
 			conf := p.fsm.pConf.ReadCopy()
 			conf.Timers.Config.KeepaliveInterval = 10
 			p.fsm.pConf.Update(&conf)
+			// openconfirm() runs with the OPEN that opensent() received.
+			p.fsm.recvOpen = grOpen(t)
 
 			p.reset(nil)
 			state, reason := tt.state(h, t.Context())
