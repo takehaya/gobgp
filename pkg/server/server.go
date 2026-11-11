@@ -1705,6 +1705,20 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 				peer.fsm.gConf.Config.RouterId, conf.Transport.State.RemoteAddress, conf.Transport.State.LocalAddress)
 			peer.peerInfo.Store(peerInfo)
 
+			// publishEstablished stores ESTABLISHED for the peer once it is
+			// prepared and before its initial table is read below, rather
+			// than leaving it to the FSM loop, which stores it only after this
+			// callback returns. A management operation can run as soon as the
+			// callback releases s.shared.mu: an AddPath or DeletePath before
+			// the loop's store would find the peer not established and skip
+			// it, while the initial table had already been read without the
+			// change, so the peer would never learn it. Published first, a
+			// change propagated before the table is read is in the table and
+			// one propagated after it is queued after it (getBestFromLocal
+			// and propagateUpdateToNeighbors exclude each other through
+			// routeRefreshInProgress). The worst case is a duplicate UPDATE.
+			publishEstablished := func() { peer.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED) }
+
 			neighborAddress := conf.State.NeighborAddress
 			deferralExpiredFunc := func(family bgp.Family, deferralTime time.Duration) func() {
 				//nolint: errcheck // ignore error
@@ -1740,6 +1754,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 				notPeerRestarting := !conf.GracefulRestart.State.PeerRestarting
 				if y := peer.IsFamilyEnabled(bgp.RF_RTC_UC); y && notPeerRestarting && c.RouteTargetMembership.Config.DeferralTime > 0 {
 					peer.setRtcEORWait(true)
+					publishEstablished()
 					s.getBestFromLocalCallback(peer, []bgp.Family{bgp.RF_RTC_UC}, true, true, func(paths []*table.Path, filtered []*table.Path) {
 						if len(paths) > 0 {
 							peer.updateRoutes(paths...)
@@ -1749,6 +1764,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 					t := c.RouteTargetMembership.Config.DeferralTime
 					time.AfterFunc(time.Second*time.Duration(t), deferralExpiredFunc(bgp.Family(0), time.Second*time.Duration(t)))
 				} else {
+					publishEstablished()
 					s.getBestFromLocalCallback(peer, peer.negotiatedRFList(), true, true, func(paths []*table.Path, filtered []*table.Path) {
 						if len(paths) > 0 {
 							peer.updateRoutes(paths...)
@@ -1773,6 +1789,9 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 					}
 					return true
 				}()
+				// After allEnd: receivedAllEOR above still saw this peer as
+				// not yet established, as before.
+				publishEstablished()
 				if allEnd {
 					for _, p := range s.neighborMap {
 						p.fsm.lock.Lock()

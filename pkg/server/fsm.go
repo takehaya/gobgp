@@ -2116,6 +2116,11 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 	}
 }
 
+// testHookAfterStateCallback, when set by a test, runs in the FSM loop after
+// the server has handled a state change and before the loop stores the new
+// state. Production code never sets it.
+var testHookAfterStateCallback func(fsm *fsm, nextState bgp.FSMState)
+
 func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -2180,6 +2185,9 @@ func (h *fsmHandler) loop(ctx context.Context, wg *sync.WaitGroup) {
 		}
 
 		h.callback(msg)
+		if testHookAfterStateCallback != nil {
+			testHookAfterStateCallback(fsm, nextState)
+		}
 		fsm.state.Store(nextState)
 		oldState = nextState
 	}
