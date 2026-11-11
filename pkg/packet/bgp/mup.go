@@ -589,6 +589,12 @@ type MUPType1SessionTransformedRoute struct {
 	SourceAddress         *netip.Addr
 	// TLVs are not part of the route key and are excluded from String().
 	TLVs []MUPTLVInterface
+	// zeroSourceAddressLength is set when a received route without a
+	// source address and without TLVs carried a SourceAddressLength octet
+	// of 0 (the -03 framing), so that it is sent again in that framing and
+	// its NLRI Length keeps matching its content. Routes built with
+	// NewMUPType1SessionTransformedRoute never set it.
+	zeroSourceAddressLength bool
 }
 
 func NewMUPType1SessionTransformedRoute(rd RouteDistinguisherInterface, prefix netip.Prefix, teid netip.Addr, qfi uint8, ea netip.Addr, sa *netip.Addr, tlvs ...MUPTLVInterface) *MUPNLRI {
@@ -680,6 +686,7 @@ func (r *MUPType1SessionTransformedRoute) DecodeFromBytes(data []byte, afi uint1
 	// Only -03 carries the trailing SourceAddressLength octet. The NLRI is bound
 	// to its declared length upstream, so len(data) is the exact route length.
 	if p >= len(data) {
+		r.zeroSourceAddressLength = false
 		return nil
 	}
 	r.SourceAddressLength = data[p]
@@ -707,6 +714,7 @@ func (r *MUPType1SessionTransformedRoute) DecodeFromBytes(data []byte, afi uint1
 		return err
 	}
 	r.TLVs = tlvs
+	r.zeroSourceAddressLength = r.SourceAddress == nil && len(r.TLVs) == 0
 	return nil
 }
 
@@ -746,11 +754,11 @@ func (r *MUPType1SessionTransformedRoute) Serialize() ([]byte, error) {
 
 // hasSourceAddressField reports whether the route is sent with the
 // SourceAddressLength octet. It is left out only when the route has neither a
-// source address nor a TLV: the draft-01 framing has no TLVs, and a decoder
-// could not tell a TLV that directly follows the Endpoint Address from a
-// SourceAddressLength octet.
+// source address nor a TLV and was not received with the octet: the draft-01
+// framing has no TLVs, and a decoder could not tell a TLV that directly
+// follows the Endpoint Address from a SourceAddressLength octet.
 func (r *MUPType1SessionTransformedRoute) hasSourceAddressField() bool {
-	return r.SourceAddress != nil || len(r.TLVs) > 0
+	return r.SourceAddress != nil || len(r.TLVs) > 0 || r.zeroSourceAddressLength
 }
 
 func (r *MUPType1SessionTransformedRoute) AFI() uint16 {
