@@ -1028,16 +1028,14 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 			}
 			pathList = append(pathList, s.sendSecondaryRoutes(peer, nil, dl)...)
 		}
-		fn(pathList, filtered)
-		return
-	}
-
-	for _, family := range peer.toGlobalFamilies(rfList) {
-		for _, path := range s.getPossibleBest(peer, family) {
-			if p := s.filterpath(peer, path, nil); p != nil {
-				pathList = append(pathList, p)
-			} else {
-				filtered = append(filtered, filteredPathForPeer(peer, path))
+	} else {
+		for _, family := range peer.toGlobalFamilies(rfList) {
+			for _, path := range s.getPossibleBest(peer, family) {
+				if p := s.filterpath(peer, path, nil); p != nil {
+					pathList = append(pathList, p)
+				} else {
+					filtered = append(filtered, filteredPathForPeer(peer, path))
+				}
 			}
 		}
 	}
@@ -1088,9 +1086,6 @@ func needToAdvertise(peer *peer) bool {
 }
 
 func (s *BgpServer) sendSecondaryRoutes(peer *peer, newPath *table.Path, dsts []*table.Update) []*table.Path {
-	if !needToAdvertise(peer) {
-		return nil
-	}
 	pl := make([]*table.Path, 0, len(dsts))
 
 	f := func(path, old *table.Path) *table.Path {
